@@ -2760,6 +2760,16 @@ static long futex_wait_restart(struct restart_block *restart)
 				restart->futex.val, tp, restart->futex.bitset);
 }
 
+static int futex_lock_fair_pi(u32 __user *uaddr, unsigned int flags,
+			 ktime_t *time, int trylock)
+{
+	/* TODO ( See futex_lock_pi() 
+	   Besides implementing this function we need to make sure that when the user-space
+	   thread fails on 0 -> TID this will be triggered instead of FUTEX_LOCK_PI,
+	   perhaps if some extra variable is set.
+	   - Carlos
+	*/
+}
 
 /*
  * Userspace tried a 0 -> TID atomic transition of the futex value
@@ -2934,6 +2944,11 @@ uaddr_faulted:
 		goto retry_private;
 
 	goto retry;
+}
+
+static int futex_unlock_fair_pi(u32 __user *uaddr, unsigned int flags)
+{
+	/* TODO As well as make this path possible on user-space when TID -> 0 fails */
 }
 
 /*
@@ -3122,6 +3137,15 @@ int handle_early_requeue_pi_wakeup(struct futex_hash_bucket *hb,
 			ret = -ERESTARTNOINTR;
 	}
 	return ret;
+}
+
+static int futex_wait_requeue_fair_pi(u32 __user *uaddr, unsigned int flags,
+				 u32 val, ktime_t *abs_time, u32 bitset,
+				 u32 __user *uaddr2)
+{
+	/* TODO Perhaps here we can just reuse the original PI wait requeue, Idk.
+	   Carlos
+	*/
 }
 
 /**
@@ -3722,8 +3746,16 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 	case FUTEX_TRYLOCK_PI:
 	case FUTEX_WAIT_REQUEUE_PI:
 	case FUTEX_CMP_REQUEUE_PI:
+	case FUTEX_LOCK_FAIR_PI:
+	case FUTEX_UNLOCK_FAIR_PI:
+	case FUTEX_TRYLOCK_FAIR_PI:
+	case FUTEX_WAIT_REQUEUE_FAIR_PI:
+	case FUTEX_CMP_REQUEUE_FAIR_PI:
+
 		if (!futex_cmpxchg_enabled)
 			return -ENOSYS;
+		else
+			printk("[!!] We need compilation with CONFIG_HAVE_FUTEX_CMPXCHG\n");
 	}
 
 	switch (cmd) {
@@ -3755,6 +3787,19 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 					     uaddr2);
 	case FUTEX_CMP_REQUEUE_PI:
 		return futex_requeue(uaddr, flags, uaddr2, val, val2, &val3, 1);
+        /* New cases with next associated functions */
+	case FUTEX_LOCK_FAIR_PI:
+		return futex_lock_fair_pi(uaddr, flags, timeout, 0);
+	case FUTEX_UNLOCK_FAIR_PI:
+		return futex_unlock_fair_pi(uaddr, flags);
+	case FUTEX_TRYLOCK_FAIR_PI:
+		return futex_lock_fair_pi(uaddr, flags, NULL, 1);
+	case FUTEX_WAIT_REQUEUE_FAIR_PI:
+		val3 = FUTEX_BITSET_MATCH_ANY;
+		return futex_wait_requeue_fair_pi(uaddr, flags, val, timeout, val3,
+					     uaddr2);
+	case FUTEX_CMP_REQUEUE_FAIR_PI:
+		return futex_requeue(uaddr, flags, uaddr2, val, val2, &val3, 1);
 	}
 	return -ENOSYS;
 }
@@ -3769,7 +3814,8 @@ SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
 	u32 val2 = 0;
 	int cmd = op & FUTEX_CMD_MASK;
 
-	if (utime && (cmd == FUTEX_WAIT || cmd == FUTEX_LOCK_PI ||
+	if (utime && (cmd == FUTEX_WAIT || cmd == FUTEX_LOCK_PI || 
+		      cmd == FUTEX_LOCK_FAIR_PI || cmd == FUTEX_WAIT_REQUEUE_FAIR_PI ||
 		      cmd == FUTEX_WAIT_BITSET ||
 		      cmd == FUTEX_WAIT_REQUEUE_PI)) {
 		if (unlikely(should_fail_futex(!(op & FUTEX_PRIVATE_FLAG))))

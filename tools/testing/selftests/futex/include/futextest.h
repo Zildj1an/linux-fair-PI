@@ -134,6 +134,26 @@ futex_unlock_pi(futex_t *uaddr, int opflags)
 }
 
 /**
+ * futex_lock_fair__pi() - block on uaddr as a FAIR PI mutex
+ * @detect:	whether (1) or not (0) to perform deadlock detection
+ */
+static inline int
+futex_lock_fair_pi(futex_t *uaddr, struct timespec *timeout, int detect,
+	      int opflags)
+{
+	return futex(uaddr, FUTEX_LOCK_FAIR_PI, detect, timeout, NULL, 0, opflags);
+}
+
+/**
+ * futex_unlock_fair_pi() - release uaddr as a FAIR PI mutex, waking the top waiter
+ */
+static inline int
+futex_unlock_fair_pi(futex_t *uaddr, int opflags)
+{
+	return futex(uaddr, FUTEX_UNLOCK_FAIR_PI, 0, NULL, NULL, 0, opflags);
+}
+
+/**
  * futex_wake_op() - FIXME: COME UP WITH A GOOD ONE LINE DESCRIPTION
  */
 static inline int

@@ -75,6 +75,24 @@ futex_unlock_pi(u_int32_t *uaddr, int opflags)
 }
 
 /**
+ * futex_lock_fair_pi() - block on uaddr as a FAIR PI mutex
+ */
+static inline int
+futex_lock_fair_pi(u_int32_t *uaddr, struct timespec *timeout, int opflags)
+{
+	return futex(uaddr, FUTEX_LOCK_FAIR_PI, 0, timeout, NULL, 0, opflags);
+}
+
+/**
+ * futex_unlock_fair_pi() - release uaddr as a FAIR PI mutex, waking the top waiter
+ */
+static inline int
+futex_unlock_fair_pi(u_int32_t *uaddr, int opflags)
+{
+	return futex(uaddr, FUTEX_UNLOCK_FAIR_PI, 0, NULL, NULL, 0, opflags);
+}
+
+/**
 * futex_cmp_requeue() - requeue tasks from uaddr to uaddr2
 * @nr_wake:        wake up to this many tasks
 * @nr_requeue:        requeue up to this many tasks
