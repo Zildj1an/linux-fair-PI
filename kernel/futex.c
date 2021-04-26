@@ -1395,7 +1395,7 @@ static int futex_lock_pi_atomic(u32 __user *uaddr, struct futex_hash_bucket *hb,
 	 * its pi_state.
 	 */
 	top_waiter = futex_top_waiter(hb, key);
-	if (top_waiter)
+	if (top_waiter) // TODO Maybe here?
 		return attach_to_pi_state(uaddr, uval, top_waiter->pi_state, ps);
 
 	/*
@@ -2762,80 +2762,141 @@ static long futex_wait_restart(struct restart_block *restart)
 
 /* TODO Besides implementing this function we need to make sure that when the 
    user-space thread fails on 0 -> TID this will be triggered instead of 
-   FUTEX_LOCK_PI, perhaps if some extra variable is set. - Carlos
+   FUTEX_LOCK_PI, perhaps if some extra variable is set. Same for the unlock and the rest
+   of new futex ops.
 */
 static int futex_lock_fair_pi(u32 __user *uaddr, unsigned int flags,
 			 ktime_t *time, int trylock)
 {
 	struct hrtimer_sleeper timeout, *to;
+	struct task_struct *exiting = NULL;
+	struct rt_mutex_waiter rt_waiter;
 	struct futex_hash_bucket *hb;
 	struct futex_q q = futex_q_init;
-	int ret;
+	int res, ret;
 
-	if (!IS_ENABLED(CONFIG_FUTEX_PI)){
+	if (!IS_ENABLED(CONFIG_FUTEX_PI)) {
 		printk("[!!] We need compilation with CONFIG_FUTEX_PI\n");
 		return -ENOSYS;
 	}
 
-	/* Init PI state of current task */
 	if (refill_pi_state_cache())
 		return -ENOMEM;
 
 	to = futex_setup_timer(time, &timeout, FLAGS_CLOCKRT, 0);
 
 retry_fair:
-	/* Get keys for the futex */
-	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &q.key);
-	
-	if (unlikely(ret != 0)) 
+
+	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &q.key, FUTEX_WRITE);
+
+	if (unlikely(ret != 0))
 		goto out_fair;
 
 retry_private_fair:
 
 	hb = queue_lock(&q);
 
-	/* Atomic acquisition of a pi-aware futex */
-	ret = futex_lock_pi_atomic(uaddr, hb, &q.key, &q.pi_state, current, 
-				   &exiting,0);
-
-	if (unlikely(ret)){
-		/* Two options: The atomic work suceeded, we have the lock, or
-	           something failed. */
-		switch(ret){
-		case 1: /* We got the lock */
+	ret = futex_lock_pi_atomic(uaddr, hb, &q.key, &q.pi_state, current,
+				   &exiting, 0);
+	if (unlikely(ret)) {
+		/*
+		 * Atomic work succeeded and we got the lock,
+		 * or failed. Either way, we do _not_ block.
+		 */
+		switch (ret) {
+		case 1:
+			/* We got the lock. */
 			ret = 0;
 			goto out_unlock_put_key_fair;
 		case -EFAULT:
 			goto uaddr_faulted_fair;
 		case -EBUSY:
 		case -EAGAIN:
-			/* Two reasons: 
-			 *   - EBUSY: Task is exiting, we can just wait.
-			 *  - EAGAIN: The user space value changed. 
+			/*
+			 * Two reasons for this:
+			 * - EBUSY: Task exiting, wait for the exit to complete.
+			 * - EAGAIN: The user space value changed.
 			 */
 			queue_unlock(hb);
-
 			wait_for_owner_exiting(ret, exiting);
 			cond_resched();
 			goto retry_fair;
 		default:
-			out_unlock_put_key_fair;
+			goto out_unlock_put_key_fair;
 		}
 	}
 
 	WARN_ON(!q.pi_state);
 
-	// TODO Identify the PI 
+	/*
+	 * Only actually queue now that the atomic ops are done:
+	 */
+	__queue_me(&q, hb);
+
+	if (trylock) {
+		ret = rt_mutex_futex_trylock(&q.pi_state->pi_mutex);
+		/* Fixup the trylock return value: */
+		ret = ret ? 0 : -EWOULDBLOCK;
+		goto no_block_fair;
+	}
+
+	rt_mutex_init_waiter(&rt_waiter);
+
+	/* See explanation on futex_lock_pi() */
+	raw_spin_lock_irq(&q.pi_state->pi_mutex.wait_lock);
+	spin_unlock(q.lock_ptr);
+	
+	/* See explanation on futex_lock_pi() */
+	ret = __rt_mutex_start_proxy_lock(&q.pi_state->pi_mutex, &rt_waiter, current);
+	raw_spin_unlock_irq(&q.pi_state->pi_mutex.wait_lock);
+
+	if (ret) {
+		if (ret == 1)
+			ret = 0;
+		goto cleanup_fair;
+	}
+
+	if (unlikely(to))
+		hrtimer_sleeper_start_expires(to, HRTIMER_MODE_ABS);
+
+	ret = rt_mutex_wait_proxy_lock(&q.pi_state->pi_mutex, to, &rt_waiter);
+
+cleanup_fair:
+
+	spin_lock(q.lock_ptr);
+	
+	/* See explanation on futex_lock_pi() */
+	if (ret && !rt_mutex_cleanup_proxy_lock(&q.pi_state->pi_mutex, &rt_waiter))
+		ret = 0;
+
+no_block_fair:
+
+	/*
+	 * Fixup the pi_state owner and possibly acquire the lock if we
+	 * haven't already.
+	 */
+	res = fixup_owner(uaddr, &q, !ret);
+
+	/*
+	 * If fixup_owner() returned an error, proprogate that.  If it acquired
+	 * the lock, clear our -ETIMEDOUT or -EINTR.
+	 */
+	if (res)
+		ret = (res < 0) ? res : 0;
+
+	/* Unqueue and drop the lock */
+	unqueue_me_pi(&q);
+	goto out_fair;
 
 out_unlock_put_key_fair:
 	queue_unlock(hb);
 
 out_fair:
-	if (to){
+	if (to) {
 		hrtimer_cancel(&to->timer);
-		destroy_hrtimer_on_stack(&to_timer);
-	}	
-	return ret != -EINTR? ret : -ERESTARTNOINTR;
+		destroy_hrtimer_on_stack(&to->timer);
+	}
+	return ret != -EINTR ? ret : -ERESTARTNOINTR;
 
 uaddr_faulted_fair:
 	queue_unlock(hb);
@@ -2847,7 +2908,7 @@ uaddr_faulted_fair:
 	if (!(flags & FLAGS_SHARED))
 		goto retry_private_fair;
 
-	goto retry_fair;	
+	goto retry_fair;
 }
 
 /*
@@ -3027,7 +3088,8 @@ uaddr_faulted:
 
 static int futex_unlock_fair_pi(u32 __user *uaddr, unsigned int flags)
 {
-	/* TODO As well as make this path possible on user-space when TID -> 0 fails */
+	/* For now, we don't need nothing different */
+	futex_unlock_pi(uaddr,flags);
 }
 
 /*
@@ -3222,9 +3284,8 @@ static int futex_wait_requeue_fair_pi(u32 __user *uaddr, unsigned int flags,
 				 u32 val, ktime_t *abs_time, u32 bitset,
 				 u32 __user *uaddr2)
 {
-	/* TODO Perhaps here we can just reuse the original PI wait requeue, Idk.
-	   Carlos
-	*/
+	/* For now, we don't need nothing different */
+	futex_wait_requeue_pi(uaddr, flags, val, abs_time, bitset, uaddr2);
 }
 
 /**
