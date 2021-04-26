@@ -2760,15 +2760,94 @@ static long futex_wait_restart(struct restart_block *restart)
 				restart->futex.val, tp, restart->futex.bitset);
 }
 
+/* TODO Besides implementing this function we need to make sure that when the 
+   user-space thread fails on 0 -> TID this will be triggered instead of 
+   FUTEX_LOCK_PI, perhaps if some extra variable is set. - Carlos
+*/
 static int futex_lock_fair_pi(u32 __user *uaddr, unsigned int flags,
 			 ktime_t *time, int trylock)
 {
-	/* TODO ( See futex_lock_pi() 
-	   Besides implementing this function we need to make sure that when the user-space
-	   thread fails on 0 -> TID this will be triggered instead of FUTEX_LOCK_PI,
-	   perhaps if some extra variable is set.
-	   - Carlos
-	*/
+	struct hrtimer_sleeper timeout, *to;
+	struct futex_hash_bucket *hb;
+	struct futex_q q = futex_q_init;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_FUTEX_PI)){
+		printk("[!!] We need compilation with CONFIG_FUTEX_PI\n");
+		return -ENOSYS;
+	}
+
+	/* Init PI state of current task */
+	if (refill_pi_state_cache())
+		return -ENOMEM;
+
+	to = futex_setup_timer(time, &timeout, FLAGS_CLOCKRT, 0);
+
+retry_fair:
+	/* Get keys for the futex */
+	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &q.key);
+	
+	if (unlikely(ret != 0)) 
+		goto out_fair;
+
+retry_private_fair:
+
+	hb = queue_lock(&q);
+
+	/* Atomic acquisition of a pi-aware futex */
+	ret = futex_lock_pi_atomic(uaddr, hb, &q.key, &q.pi_state, current, 
+				   &exiting,0);
+
+	if (unlikely(ret)){
+		/* Two options: The atomic work suceeded, we have the lock, or
+	           something failed. */
+		switch(ret){
+		case 1: /* We got the lock */
+			ret = 0;
+			goto out_unlock_put_key_fair;
+		case -EFAULT:
+			goto uaddr_faulted_fair;
+		case -EBUSY:
+		case -EAGAIN:
+			/* Two reasons: 
+			 *   - EBUSY: Task is exiting, we can just wait.
+			 *  - EAGAIN: The user space value changed. 
+			 */
+			queue_unlock(hb);
+
+			wait_for_owner_exiting(ret, exiting);
+			cond_resched();
+			goto retry_fair;
+		default:
+			out_unlock_put_key_fair;
+		}
+	}
+
+	WARN_ON(!q.pi_state);
+
+	// TODO Identify the PI 
+
+out_unlock_put_key_fair:
+	queue_unlock(hb);
+
+out_fair:
+	if (to){
+		hrtimer_cancel(&to->timer);
+		destroy_hrtimer_on_stack(&to_timer);
+	}	
+	return ret != -EINTR? ret : -ERESTARTNOINTR;
+
+uaddr_faulted_fair:
+	queue_unlock(hb);
+
+	ret = fault_in_user_writeable(uaddr);
+	if (ret)
+		goto out_fair;
+
+	if (!(flags & FLAGS_SHARED))
+		goto retry_private_fair;
+
+	goto retry_fair;	
 }
 
 /*
@@ -4012,6 +4091,7 @@ SYSCALL_DEFINE6(futex_time32, u32 __user *, uaddr, int, op, u32, val,
 	int cmd = op & FUTEX_CMD_MASK;
 
 	if (utime && (cmd == FUTEX_WAIT || cmd == FUTEX_LOCK_PI ||
+		      cmd == FUTEX_LOCK_FAIR_PI || cmd == FUTEX_WAIT_REQUEUE_FAIR_PI ||
 		      cmd == FUTEX_WAIT_BITSET ||
 		      cmd == FUTEX_WAIT_REQUEUE_PI)) {
 		if (get_old_timespec32(&ts, utime))
