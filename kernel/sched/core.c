@@ -5584,7 +5584,7 @@ int cb2_lock(struct task_struct *p, struct task_struct *pi_task)
 	raw_spin_lock(&rq->lock);
 
 	/* Used to inhibit CPU hot-plugs operations */
-    get_online_cpus();
+	get_online_cpus();
 
 	num_cores = num_online_cpus();
 
