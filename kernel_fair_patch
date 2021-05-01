@@ -1,0 +1,479 @@
+diff -urN original/include/linux/sched.h linux-fair-PI/include/linux/sched.h
+--- original/include/linux/sched.h	2021-05-01 15:22:52.337368928 -0400
++++ linux-fair-PI/include/linux/sched.h	2021-05-01 15:18:52.135940782 -0400
+@@ -647,6 +647,11 @@
+ };
+ 
+ struct task_struct {
++
++	/* Flag to label our threads, so the scheduler knows whether or
++	   not to boost with PI */
++	int is_cb2lock:1;
++
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+ 	 * For reasons of header soup (see current_thread_info()), this
+diff -urN original/include/uapi/linux/futex.h linux-fair-PI/include/uapi/linux/futex.h
+--- original/include/uapi/linux/futex.h	2021-05-01 15:22:52.337368928 -0400
++++ linux-fair-PI/include/uapi/linux/futex.h	2021-05-01 15:18:52.311942004 -0400
+@@ -22,6 +22,13 @@
+ #define FUTEX_WAIT_REQUEUE_PI	11
+ #define FUTEX_CMP_REQUEUE_PI	12
+ 
++/* New futex operations */
++#define FUTEX_LOCK_FAIR_PI              13
++#define FUTEX_UNLOCK_FAIR_PI            14
++#define FUTEX_TRYLOCK_FAIR_PI	        15
++#define FUTEX_WAIT_REQUEUE_FAIR_PI	16
++#define FUTEX_CMP_REQUEUE_FAIR_PI	17
++
+ #define FUTEX_PRIVATE_FLAG	128
+ #define FUTEX_CLOCK_REALTIME	256
+ #define FUTEX_CMD_MASK		~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME)
+@@ -33,7 +40,13 @@
+ #define FUTEX_WAKE_OP_PRIVATE	(FUTEX_WAKE_OP | FUTEX_PRIVATE_FLAG)
+ #define FUTEX_LOCK_PI_PRIVATE	(FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG)
+ #define FUTEX_UNLOCK_PI_PRIVATE	(FUTEX_UNLOCK_PI | FUTEX_PRIVATE_FLAG)
++
++#define FUTEX_LOCK_FAIR_PI_PRIVATE	(FUTEX_LOCK_FAIR_PI | FUTEX_PRIVATE_FLAG)
++#define FUTEX_UNLOCK_FAIR_PI_PRIVATE	(FUTEX_UNLOCK_FAIR_PI | FUTEX_PRIVATE_FLAG)
++
+ #define FUTEX_TRYLOCK_PI_PRIVATE (FUTEX_TRYLOCK_PI | FUTEX_PRIVATE_FLAG)
++#define FUTEX_TRYLOCK_FAIR_PI_PRIVATE (FUTEX_TRYLOCK_FAIR__PI | FUTEX_PRIVATE_FLAG)
++
+ #define FUTEX_WAIT_BITSET_PRIVATE	(FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG)
+ #define FUTEX_WAKE_BITSET_PRIVATE	(FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG)
+ #define FUTEX_WAIT_REQUEUE_PI_PRIVATE	(FUTEX_WAIT_REQUEUE_PI | \
+@@ -41,6 +54,11 @@
+ #define FUTEX_CMP_REQUEUE_PI_PRIVATE	(FUTEX_CMP_REQUEUE_PI | \
+ 					 FUTEX_PRIVATE_FLAG)
+ 
++#define FUTEX_WAIT_REQUEUE_FAIR_PI_PRIVATE	(FUTEX_WAIT_REQUEUE_FAIR_PI | \
++					 FUTEX_PRIVATE_FLAG)
++#define FUTEX_CMP_REQUEUE_FAIR_PI_PRIVATE	(FUTEX_CMP_REQUEUE_FAIR_PI | \
++					 FUTEX_PRIVATE_FLAG)
++
+ /*
+  * Support for robust futexes: the kernel cleans up held futexes at
+  * thread exit time.
+diff -urN original/kernel/futex.c linux-fair-PI/kernel/futex.c
+--- original/kernel/futex.c	2021-05-01 15:22:52.337368928 -0400
++++ linux-fair-PI/kernel/futex.c	2021-05-01 15:18:52.407942671 -0400
+@@ -1395,7 +1395,7 @@
+ 	 * its pi_state.
+ 	 */
+ 	top_waiter = futex_top_waiter(hb, key);
+-	if (top_waiter)
++	if (top_waiter) // TODO Maybe here?
+ 		return attach_to_pi_state(uaddr, uval, top_waiter->pi_state, ps);
+ 
+ 	/*
+@@ -2760,6 +2760,158 @@
+ 				restart->futex.val, tp, restart->futex.bitset);
+ }
+ 
++/* TODO Besides implementing this function we need to make sure that when the 
++   user-space thread fails on 0 -> TID this will be triggered instead of 
++   FUTEX_LOCK_PI, perhaps if some extra variable is set. Same for the unlock and the rest
++   of new futex ops.
++*/
++static int futex_lock_fair_pi(u32 __user *uaddr, unsigned int flags,
++			 ktime_t *time, int trylock)
++{
++	struct hrtimer_sleeper timeout, *to;
++	struct task_struct *exiting = NULL;
++	struct rt_mutex_waiter rt_waiter;
++	struct futex_hash_bucket *hb;
++	struct futex_q q = futex_q_init;
++	int res, ret;
++
++	if (!IS_ENABLED(CONFIG_FUTEX_PI)) {
++		printk("[!!] We need compilation with CONFIG_FUTEX_PI\n");
++		return -ENOSYS;
++	}
++
++	/* Init PI state of current task */
++	if (refill_pi_state_cache())
++		return -ENOMEM;
++
++	to = futex_setup_timer(time, &timeout, FLAGS_CLOCKRT, 0);
++
++retry_fair:
++
++	/* Get keys for the futex */
++	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &q.key, FUTEX_WRITE);
++
++	if (unlikely(ret != 0))
++		goto out_fair;
++
++retry_private_fair:
++
++	hb = queue_lock(&q);
++
++	ret = futex_lock_pi_atomic(uaddr, hb, &q.key, &q.pi_state, current,
++				   &exiting, 0);
++	if (unlikely(ret)) {
++		/*
++		 * Atomic work succeeded and we got the lock,
++		 * or failed. Either way, we do _not_ block.
++		 */
++		switch (ret) {
++		case 1:
++			/* We got the lock. */
++			ret = 0;
++			goto out_unlock_put_key_fair;
++		case -EFAULT:
++			goto uaddr_faulted_fair;
++		case -EBUSY:
++		case -EAGAIN:
++			/*
++			 * Two reasons for this:
++			 * - EBUSY: Task exiting, wait for the exit to complete.
++			 * - EAGAIN: The user space value changed.
++			 */
++			queue_unlock(hb);
++			wait_for_owner_exiting(ret, exiting);
++			cond_resched();
++			goto retry_fair;
++		default:
++			goto out_unlock_put_key_fair;
++		}
++	}
++
++	WARN_ON(!q.pi_state);
++
++	/*
++	 * Only actually queue now that the atomic ops are done:
++	 */
++	__queue_me(&q, hb);
++
++	if (trylock) {
++		ret = rt_mutex_futex_trylock(&q.pi_state->pi_mutex);
++		/* Fixup the trylock return value: */
++		ret = ret ? 0 : -EWOULDBLOCK;
++		goto no_block_fair;
++	}
++
++	rt_mutex_init_waiter(&rt_waiter);
++
++	/* See explanation on futex_lock_pi() */
++	raw_spin_lock_irq(&q.pi_state->pi_mutex.wait_lock);
++	spin_unlock(q.lock_ptr);
++	
++	/* See explanation on futex_lock_pi() */
++	ret = __rt_mutex_start_proxy_lock(&q.pi_state->pi_mutex, &rt_waiter, current);
++	raw_spin_unlock_irq(&q.pi_state->pi_mutex.wait_lock);
++
++	if (ret) {
++		if (ret == 1)
++			ret = 0;
++		goto cleanup_fair;
++	}
++
++	if (unlikely(to))
++		hrtimer_sleeper_start_expires(to, HRTIMER_MODE_ABS);
++
++	ret = rt_mutex_wait_proxy_lock(&q.pi_state->pi_mutex, to, &rt_waiter);
++
++cleanup_fair:
++
++	spin_lock(q.lock_ptr);
++	
++	/* See explanation on futex_lock_pi() */
++	if (ret && !rt_mutex_cleanup_proxy_lock(&q.pi_state->pi_mutex, &rt_waiter))
++		ret = 0;
++
++no_block_fair:
++
++	/*
++	 * Fixup the pi_state owner and possibly acquire the lock if we
++	 * haven't already.
++	 */
++	res = fixup_owner(uaddr, &q, !ret);
++
++	/*
++	 * If fixup_owner() returned an error, proprogate that.  If it acquired
++	 * the lock, clear our -ETIMEDOUT or -EINTR.
++	 */
++	if (res)
++		ret = (res < 0) ? res : 0;
++
++	/* Unqueue and drop the lock */
++	unqueue_me_pi(&q);
++	goto out_fair;
++
++out_unlock_put_key_fair:
++	queue_unlock(hb);
++
++out_fair:
++	if (to) {
++		hrtimer_cancel(&to->timer);
++		destroy_hrtimer_on_stack(&to->timer);
++	}
++	return ret != -EINTR ? ret : -ERESTARTNOINTR;
++
++uaddr_faulted_fair:
++	queue_unlock(hb);
++
++	ret = fault_in_user_writeable(uaddr);
++	if (ret)
++		goto out_fair;
++
++	if (!(flags & FLAGS_SHARED))
++		goto retry_private_fair;
++
++	goto retry_fair;
++}
+ 
+ /*
+  * Userspace tried a 0 -> TID atomic transition of the futex value
+@@ -2936,6 +3088,12 @@
+ 	goto retry;
+ }
+ 
++static int futex_unlock_fair_pi(u32 __user *uaddr, unsigned int flags)
++{
++	/* For now, we don't need nothing different */
++	futex_unlock_pi(uaddr,flags);
++}
++
+ /*
+  * Userspace attempted a TID -> 0 atomic transition, and failed.
+  * This is the in-kernel slowpath: we look up the PI state (if any),
+@@ -3124,6 +3282,14 @@
+ 	return ret;
+ }
+ 
++static int futex_wait_requeue_fair_pi(u32 __user *uaddr, unsigned int flags,
++				 u32 val, ktime_t *abs_time, u32 bitset,
++				 u32 __user *uaddr2)
++{
++	/* For now, we don't need nothing different */
++	futex_wait_requeue_pi(uaddr, flags, val, abs_time, bitset, uaddr2);
++}
++
+ /**
+  * futex_wait_requeue_pi() - Wait on uaddr and take uaddr2
+  * @uaddr:	the futex we initially wait on (non-pi)
+@@ -3715,6 +3881,19 @@
+ 		    cmd != FUTEX_WAIT_REQUEUE_PI)
+ 			return -ENOSYS;
+ 	}
++	
++	/* Flag the thread */
++	switch(cmd){
++	case FUTEX_LOCK_FAIR_PI:
++	case FUTEX_UNLOCK_FAIR_PI:
++	case FUTEX_TRYLOCK_FAIR_PI:
++	case FUTEX_WAIT_REQUEUE_FAIR_PI:
++	case FUTEX_CMP_REQUEUE_FAIR_PI:
++		current->is_cb2lock = 1;
++	break;
++	default:
++		current->is_cb2lock = 0;
++	}
+ 
+ 	switch (cmd) {
+ 	case FUTEX_LOCK_PI:
+@@ -3722,8 +3901,16 @@
+ 	case FUTEX_TRYLOCK_PI:
+ 	case FUTEX_WAIT_REQUEUE_PI:
+ 	case FUTEX_CMP_REQUEUE_PI:
++	case FUTEX_LOCK_FAIR_PI:
++	case FUTEX_UNLOCK_FAIR_PI:
++	case FUTEX_TRYLOCK_FAIR_PI:
++	case FUTEX_WAIT_REQUEUE_FAIR_PI:
++	case FUTEX_CMP_REQUEUE_FAIR_PI:
++
+ 		if (!futex_cmpxchg_enabled)
+ 			return -ENOSYS;
++		else
++			printk("[!!] We need compilation with CONFIG_HAVE_FUTEX_CMPXCHG\n");
+ 	}
+ 
+ 	switch (cmd) {
+@@ -3755,6 +3942,19 @@
+ 					     uaddr2);
+ 	case FUTEX_CMP_REQUEUE_PI:
+ 		return futex_requeue(uaddr, flags, uaddr2, val, val2, &val3, 1);
++        /* New cases with next associated functions */
++	case FUTEX_LOCK_FAIR_PI:
++		return futex_lock_fair_pi(uaddr, flags, timeout, 0);
++	case FUTEX_UNLOCK_FAIR_PI:
++		return futex_unlock_fair_pi(uaddr, flags);
++	case FUTEX_TRYLOCK_FAIR_PI:
++		return futex_lock_fair_pi(uaddr, flags, NULL, 1);
++	case FUTEX_WAIT_REQUEUE_FAIR_PI:
++		val3 = FUTEX_BITSET_MATCH_ANY;
++		return futex_wait_requeue_fair_pi(uaddr, flags, val, timeout, val3,
++					     uaddr2);
++	case FUTEX_CMP_REQUEUE_FAIR_PI:
++		return futex_requeue(uaddr, flags, uaddr2, val, val2, &val3, 1);
+ 	}
+ 	return -ENOSYS;
+ }
+@@ -3769,7 +3969,8 @@
+ 	u32 val2 = 0;
+ 	int cmd = op & FUTEX_CMD_MASK;
+ 
+-	if (utime && (cmd == FUTEX_WAIT || cmd == FUTEX_LOCK_PI ||
++	if (utime && (cmd == FUTEX_WAIT || cmd == FUTEX_LOCK_PI || 
++		      cmd == FUTEX_LOCK_FAIR_PI || cmd == FUTEX_WAIT_REQUEUE_FAIR_PI ||
+ 		      cmd == FUTEX_WAIT_BITSET ||
+ 		      cmd == FUTEX_WAIT_REQUEUE_PI)) {
+ 		if (unlikely(should_fail_futex(!(op & FUTEX_PRIVATE_FLAG))))
+@@ -3966,6 +4167,7 @@
+ 	int cmd = op & FUTEX_CMD_MASK;
+ 
+ 	if (utime && (cmd == FUTEX_WAIT || cmd == FUTEX_LOCK_PI ||
++		      cmd == FUTEX_LOCK_FAIR_PI || cmd == FUTEX_WAIT_REQUEUE_FAIR_PI ||
+ 		      cmd == FUTEX_WAIT_BITSET ||
+ 		      cmd == FUTEX_WAIT_REQUEUE_PI)) {
+ 		if (get_old_timespec32(&ts, utime))
+diff -urN original/kernel/sched/core.c linux-fair-PI/kernel/sched/core.c
+--- original/kernel/sched/core.c	2021-05-01 15:22:52.341368949 -0400
++++ linux-fair-PI/kernel/sched/core.c	2021-05-01 15:18:52.439942894 -0400
+@@ -5560,6 +5560,75 @@
+ 	return __rt_effective_prio(pi_task, prio);
+ }
+ 
++int cb2_lock(struct task_struct *p, struct task_struct *pi_task)
++{
++	int cpu, num_cores, num_tickets, K = 5, winning_ticket;
++	unsigned long flags;
++	struct task_struct *g,*p2;
++	struct rq *rq;
++
++	/* Make sure that we are not dealing with a task using regular PI */
++	if (!p->is_cb2lock){
++		goto go_ahead_pi;
++	}
++
++	/* ----------------------------------------------------------------
++	   [1] We compute num_tickets, which is the sum of the tickets each 
++	   thread has.
++	   ----------------------------------------------------------------
++	*/
++	
++	raw_spin_lock_irqsave(&p->pi_lock, flags);
++	
++	rq = task_rq(p);
++	raw_spin_lock(&rq->lock);
++
++	/* Used to inhibit CPU hot-plugs operations */
++	get_online_cpus();
++
++	num_cores = num_online_cpus();
++
++	/* Get the core this task is running on */
++	cpu = task_cpu(p); 
++
++	printk("Handling thread %d at core %d/%d\n",p->pid,cpu,num_cores);
++
++	for_each_process_thread(g, p2) 
++	{
++		if (task_cpu(p2) != cpu)
++			continue;
++	
++		/* Lock owner */
++		if (p->pid == p2->pid){
++			num_tickets += p2->normal_prio + K; 
++		}
++		else { /* Bystander */ 
++			num_tickets += p2->normal_prio;
++		}
++	}
++
++	printk("Num tickets = %d\n",num_tickets);
++
++	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
++
++	/* ----------------------------------------------------------------
++		[2] Obtain the winning ticket, between [0,num_tickets)
++	   ----------------------------------------------------------------
++	*/
++
++	get_random_bytes(&winning_ticket, sizeof(winning_ticket));
++	winning_ticket = winning_ticket % num_tickets;
++
++	if (winning_ticket < p2->normal_prio + K){
++		goto go_ahead_pi;
++	}
++
++	return 0;
++
++go_ahead_pi:
++	return 1;
++}
++
+ /*
+  * rt_mutex_setprio - set the current priority of a task
+  * @p: task to boost
+@@ -5588,6 +5657,9 @@
+ 	if (p->pi_top_task == pi_task && prio == p->prio && !dl_prio(prio))
+ 		return;
+ 
++	if (!cb2_lock(p,pi_task))
++		return;
++
+ 	rq = __task_rq_lock(p, &rf);
+ 	update_rq_clock(rq);
+ 	/*
+diff -urN original/tools/perf/bench/futex.h linux-fair-PI/tools/perf/bench/futex.h
+--- original/tools/perf/bench/futex.h	2021-05-01 15:22:52.341368949 -0400
++++ linux-fair-PI/tools/perf/bench/futex.h	2021-05-01 15:18:53.431949781 -0400
+@@ -75,6 +75,24 @@
+ }
+ 
+ /**
++ * futex_lock_fair_pi() - block on uaddr as a FAIR PI mutex
++ */
++static inline int
++futex_lock_fair_pi(u_int32_t *uaddr, struct timespec *timeout, int opflags)
++{
++	return futex(uaddr, FUTEX_LOCK_FAIR_PI, 0, timeout, NULL, 0, opflags);
++}
++
++/**
++ * futex_unlock_fair_pi() - release uaddr as a FAIR PI mutex, waking the top waiter
++ */
++static inline int
++futex_unlock_fair_pi(u_int32_t *uaddr, int opflags)
++{
++	return futex(uaddr, FUTEX_UNLOCK_FAIR_PI, 0, NULL, NULL, 0, opflags);
++}
++
++/**
+ * futex_cmp_requeue() - requeue tasks from uaddr to uaddr2
+ * @nr_wake:        wake up to this many tasks
+ * @nr_requeue:        requeue up to this many tasks
+diff -urN original/tools/testing/selftests/futex/include/futextest.h linux-fair-PI/tools/testing/selftests/futex/include/futextest.h
+--- original/tools/testing/selftests/futex/include/futextest.h	2021-05-01 15:22:52.341368949 -0400
++++ linux-fair-PI/tools/testing/selftests/futex/include/futextest.h	2021-05-01 15:18:53.651951307 -0400
+@@ -134,6 +134,26 @@
+ }
+ 
+ /**
++ * futex_lock_fair__pi() - block on uaddr as a FAIR PI mutex
++ * @detect:	whether (1) or not (0) to perform deadlock detection
++ */
++static inline int
++futex_lock_fair_pi(futex_t *uaddr, struct timespec *timeout, int detect,
++	      int opflags)
++{
++	return futex(uaddr, FUTEX_LOCK_FAIR_PI, detect, timeout, NULL, 0, opflags);
++}
++
++/**
++ * futex_unlock_fair_pi() - release uaddr as a FAIR PI mutex, waking the top waiter
++ */
++static inline int
++futex_unlock_fair_pi(futex_t *uaddr, int opflags)
++{
++	return futex(uaddr, FUTEX_UNLOCK_FAIR_PI, 0, NULL, NULL, 0, opflags);
++}
++
++/**
+  * futex_wake_op() - FIXME: COME UP WITH A GOOD ONE LINE DESCRIPTION
+  */
+ static inline int
