@@ -1,0 +1,68 @@
+diff -urN original_libc/nptl/pthread_mutex_trylock.c glibc/nptl/pthread_mutex_trylock.c
+--- original_libc/nptl/pthread_mutex_trylock.c	2021-05-01 13:34:02.588514030 -0400
++++ glibc/nptl/pthread_mutex_trylock.c	2021-05-01 13:25:33.675421561 -0400
+@@ -290,7 +290,7 @@
+ 			   ? PTHREAD_ROBUST_MUTEX_PSHARED (mutex)
+ 			   : PTHREAD_MUTEX_PSHARED (mutex));
+ 	    int e = INTERNAL_SYSCALL_CALL (futex, &mutex->__data.__lock,
+-					   __lll_private_flag (FUTEX_TRYLOCK_PI,
++					   __lll_private_flag (FUTEX_TRYLOCK_FAIR_PI,
+ 							       private), 0, 0);
+ 
+ 	    if (INTERNAL_SYSCALL_ERROR_P (e)
+diff -urN original_libc/sysdeps/nptl/futex-internal.h glibc/sysdeps/nptl/futex-internal.h
+--- original_libc/sysdeps/nptl/futex-internal.h	2021-05-01 13:34:02.816514381 -0400
++++ glibc/sysdeps/nptl/futex-internal.h	2021-05-01 13:21:05.811169236 -0400
+@@ -256,7 +256,7 @@
+ {
+   int err = INTERNAL_SYSCALL_CALL (futex_time64, futex_word,
+                                    __lll_private_flag
+-                                   (FUTEX_LOCK_PI, private), 0, abstime);
++                                   (FUTEX_LOCK_FAIR_PI, private), 0, abstime);
+ #ifndef __ASSUME_TIME64_SYSCALLS
+   if (err == -ENOSYS)
+     {
+@@ -268,7 +268,7 @@
+         ts32 = valid_timespec64_to_timespec (*abstime);
+ 
+       err = INTERNAL_SYSCALL_CALL (futex, futex_word, __lll_private_flag
+-                                   (FUTEX_LOCK_PI, private), 0,
++                                   (FUTEX_LOCK_FAIR_PI, private), 0,
+                                    abstime != NULL ? &ts32 : NULL);
+     }
+ #endif
+diff -urN original_libc/sysdeps/nptl/lowlevellock-futex.h glibc/sysdeps/nptl/lowlevellock-futex.h
+--- original_libc/sysdeps/nptl/lowlevellock-futex.h	2021-05-01 13:34:02.816514381 -0400
++++ glibc/sysdeps/nptl/lowlevellock-futex.h	2021-05-01 13:26:21.131558603 -0400
+@@ -38,6 +38,13 @@
+ #define FUTEX_WAKE_BITSET	10
+ #define FUTEX_WAIT_REQUEUE_PI   11
+ #define FUTEX_CMP_REQUEUE_PI    12
++
++#define FUTEX_LOCK_FAIR_PI              13
++#define FUTEX_UNLOCK_FAIR_PI            14
++#define FUTEX_TRYLOCK_FAIR_PI           15
++#define FUTEX_WAIT_REQUEUE_FAIR_PI      16
++#define FUTEX_CMP_REQUEUE_FAIR_PI       17
++
+ #define FUTEX_PRIVATE_FLAG	128
+ #define FUTEX_CLOCK_REALTIME	256
+ 
+@@ -106,7 +113,7 @@
+ 
+ #define lll_futex_timed_unlock_pi(futexp, private) 			\
+   lll_futex_syscall (4, futexp,						\
+-		     __lll_private_flag (FUTEX_UNLOCK_PI, private),	\
++		     __lll_private_flag (FUTEX_UNLOCK_FAIR_PI, private),	\
+ 		     0, 0)
+ 
+ /* Like lll_futex_requeue, but pairs with lll_futex_wait_requeue_pi
+@@ -114,7 +121,7 @@
+ # define lll_futex_cmp_requeue_pi(futexp, nr_wake, nr_move, mutex,       \
+                                  val, private)                          \
+   lll_futex_syscall (6, futexp,                                         \
+-		     __lll_private_flag (FUTEX_CMP_REQUEUE_PI,          \
++		     __lll_private_flag (FUTEX_CMP_REQUEUE_FAIR_PI,          \
+ 					 private),                      \
+ 		     nr_wake, nr_move, mutex, val)
+ 
