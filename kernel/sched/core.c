@@ -5560,6 +5560,75 @@ static inline int rt_effective_prio(struct task_struct *p, int prio)
 	return __rt_effective_prio(pi_task, prio);
 }
 
+int cb2_lock(struct task_struct *p, struct task_struct *pi_task)
+{
+	int cpu, num_cores, num_tickets, K = 5, winning_ticket;
+	unsigned long flags;
+	struct task_struct *g,*p2;
+	struct rq *rq;
+
+	/* Make sure that we are not dealing with a task using regular PI */
+	if (!p->is_cb2lock){
+		goto go_ahead_pi;
+	}
+
+	/* ----------------------------------------------------------------
+	   [1] We compute num_tickets, which is the sum of the tickets each 
+	   thread has.
+	   ----------------------------------------------------------------
+	*/
+	
+	raw_spin_lock_irqsave(&p->pi_lock, flags);
+	
+	rq = task_rq(p);
+	raw_spin_lock(&rq->lock);
+
+	/* Used to inhibit CPU hot-plugs operations */
+    get_online_cpus();
+
+	num_cores = num_online_cpus();
+
+	/* Get the core this task is running on */
+	cpu = task_cpu(p); 
+
+	printk("Handling thread %d at core %d/%d\n",p->pid,cpu,num_cores);
+
+	for_each_process_thread(g, p2) 
+	{
+		if (task_cpu(p2) != cpu)
+			continue;
+	
+		/* Lock owner */
+		if (p->pid == p2->pid){
+			num_tickets += p2->normal_prio + K; 
+		}
+		else { /* Bystander */ 
+			num_tickets += p2->normal_prio;
+		}
+	}
+
+	printk("Num tickets = %d\n",num_tickets);
+
+	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+
+	/* ----------------------------------------------------------------
+		[2] Obtain the winning ticket, between [0,num_tickets)
+	   ----------------------------------------------------------------
+	*/
+
+	get_random_bytes(&winning_ticket, sizeof(winning_ticket));
+	winning_ticket = winning_ticket % num_tickets;
+
+	if (winning_ticket < p2->normal_prio + K){
+		goto go_ahead_pi;
+	}
+
+	return 0;
+
+go_ahead_pi:
+	return 1;
+}
+
 /*
  * rt_mutex_setprio - set the current priority of a task
  * @p: task to boost
@@ -5586,6 +5655,9 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	 * If nothing changed; bail early.
 	 */
 	if (p->pi_top_task == pi_task && prio == p->prio && !dl_prio(prio))
+		return;
+
+	if (!cb2_lock(p,pi_task))
 		return;
 
 	rq = __task_rq_lock(p, &rf);

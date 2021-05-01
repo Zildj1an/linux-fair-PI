@@ -647,6 +647,11 @@ struct kmap_ctrl {
 };
 
 struct task_struct {
+
+	/* Flag to label our threads, so the scheduler knows whether or
+	   not to boost with PI */
+	int is_cb2lock:1;
+
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/*
 	 * For reasons of header soup (see current_thread_info()), this

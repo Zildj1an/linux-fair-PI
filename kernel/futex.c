@@ -2780,6 +2780,7 @@ static int futex_lock_fair_pi(u32 __user *uaddr, unsigned int flags,
 		return -ENOSYS;
 	}
 
+	/* Init PI state of current task */
 	if (refill_pi_state_cache())
 		return -ENOMEM;
 
@@ -2787,6 +2788,7 @@ static int futex_lock_fair_pi(u32 __user *uaddr, unsigned int flags,
 
 retry_fair:
 
+	/* Get keys for the futex */
 	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &q.key, FUTEX_WRITE);
 
 	if (unlikely(ret != 0))
@@ -3878,6 +3880,19 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 		if (cmd != FUTEX_WAIT && cmd != FUTEX_WAIT_BITSET && \
 		    cmd != FUTEX_WAIT_REQUEUE_PI)
 			return -ENOSYS;
+	}
+	
+	/* Flag the thread */
+	switch(cmd){
+	case FUTEX_LOCK_FAIR_PI:
+	case FUTEX_UNLOCK_FAIR_PI:
+	case FUTEX_TRYLOCK_FAIR_PI:
+	case FUTEX_WAIT_REQUEUE_FAIR_PI:
+	case FUTEX_CMP_REQUEUE_FAIR_PI:
+		current->is_cb2lock = 1;
+	break;
+	default:
+		current->is_cb2lock = 0;
 	}
 
 	switch (cmd) {
