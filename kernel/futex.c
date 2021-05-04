@@ -3088,12 +3088,6 @@ uaddr_faulted:
 	goto retry;
 }
 
-static int futex_unlock_fair_pi(u32 __user *uaddr, unsigned int flags)
-{
-	/* For now, we don't need nothing different */
-	futex_unlock_pi(uaddr,flags);
-}
-
 /*
  * Userspace attempted a TID -> 0 atomic transition, and failed.
  * This is the in-kernel slowpath: we look up the PI state (if any),
@@ -3233,6 +3227,12 @@ pi_faulted:
 	return ret;
 }
 
+static int futex_unlock_fair_pi(u32 __user *uaddr, unsigned int flags)
+{
+	/* For now, we don't need nothing different */
+	return futex_unlock_pi(uaddr,flags);
+}
+
 /**
  * handle_early_requeue_pi_wakeup() - Detect early wakeup on the initial futex
  * @hb:		the hash_bucket futex_q was original enqueued on
@@ -3280,14 +3280,6 @@ int handle_early_requeue_pi_wakeup(struct futex_hash_bucket *hb,
 			ret = -ERESTARTNOINTR;
 	}
 	return ret;
-}
-
-static int futex_wait_requeue_fair_pi(u32 __user *uaddr, unsigned int flags,
-				 u32 val, ktime_t *abs_time, u32 bitset,
-				 u32 __user *uaddr2)
-{
-	/* For now, we don't need nothing different */
-	futex_wait_requeue_pi(uaddr, flags, val, abs_time, bitset, uaddr2);
 }
 
 /**
@@ -3475,6 +3467,15 @@ out:
 	}
 	return ret;
 }
+
+static int futex_wait_requeue_fair_pi(u32 __user *uaddr, unsigned int flags,
+				 u32 val, ktime_t *abs_time, u32 bitset,
+				 u32 __user *uaddr2)
+{
+	/* For now, we don't need nothing different */
+	return futex_wait_requeue_pi(uaddr, flags, val, abs_time, bitset, uaddr2);
+}
+
 
 /*
  * Support for robust futexes: the kernel cleans up held futexes at
